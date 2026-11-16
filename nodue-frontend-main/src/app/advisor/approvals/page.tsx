@@ -1,0 +1,395 @@
+"use client";
+
+import React, { useEffect, useState, useCallback } from "react";
+import {
+  getAdvisorApprovals,
+  decideAdvisorApproval,
+  getAdvisorStudentStatus,
+  approveStudentFeeVerification,
+  AdvisorPendingRow,
+  AdvisorDecidedRow,
+  AdvisorQueueStatus,
+} from "@/lib/advisor-api";
+import { ApiError } from "@/lib/api";
+import { Search, RefreshCw, Check, X, Activity, CreditCard } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { PageHeader, Badge, Button, Input } from "@/components/ui/controls";
+import { Modal } from "@/components/ui/overlays";
+import { TableSkeleton, EmptyState, ErrorState, Pagination, ButtonSpinner } from "@/components/ui/feedback";  import { StatusBadge } from "@/components/ui/status";
+import { ClearanceModal } from "@/components/clearance/ClearanceModal";
+
+import { ApprovalFilterBar, TabCountMap } from "@/components/approvals/ApprovalFilterBar";
+
+type Row = AdvisorPendingRow | AdvisorDecidedRow;
+
+function isDecided(row: Row): row is AdvisorDecidedRow {
+  return row.status !== "PENDING";
+}
+
+export default function AdvisorApprovalsPage() {
+  const router = useRouter();
+  const [rows, setRows] = useState<Row[]>([]);
+  const [meta, setMeta] = useState({ total: 0, page: 1, limit: 20, totalPages: 1 });
+  const [counts, setCounts] = useState<TabCountMap>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [viewingStatusStudent, setViewingStatusStudent] = useState<{ id: string; name: string; registerNumber: string } | null>(null);
+
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<AdvisorQueueStatus>("pending");
+  const [currentPage, setCurrentPage] = useState(1);
+
+  const [acting, setActing] = useState<AdvisorPendingRow | null>(null);
+  const [decision, setDecision] = useState<"APPROVED" | "REJECTED">("APPROVED");
+  const [remarks, setRemarks] = useState("");
+  const [remarksError, setRemarksError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [feeVerifying, setFeeVerifying] = useState<string | null>(null);
+
+  const fetchTabCounts = useCallback(async (searchQuery: string) => {
+    try {
+      const q = searchQuery || undefined;
+      const [p, a, r, d] = await Promise.all([
+        getAdvisorApprovals({ status: "pending", limit: 1, search: q }),
+        getAdvisorApprovals({ status: "approved", limit: 1, search: q }),
+        getAdvisorApprovals({ status: "rejected", limit: 1, search: q }),
+        getAdvisorApprovals({ status: "decided", limit: 1, search: q }),
+      ]);
+      setCounts({
+        pending: p.meta.total,
+        approved: a.meta.total,
+        rejected: r.meta.total,
+        decided: d.meta.total,
+      });
+    } catch {
+      // Ignore count fetch errors
+    }
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const searchQuery = search.trim();
+      const res = await getAdvisorApprovals({
+        page: currentPage,
+        limit: 20,
+        search: searchQuery || undefined,
+        status: statusFilter,
+      });
+      setRows(res.data);
+      setMeta(res.meta);
+      fetchTabCounts(searchQuery);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to load approvals.");
+    } finally {
+      setLoading(false);
+    }
+  }, [currentPage, search, statusFilter, fetchTabCounts]);
+
+  useEffect(() => {
+    const t = setTimeout(load, search ? 300 : 0);
+    return () => clearTimeout(t);
+  }, [load, search]);
+
+  const openDecision = (row: AdvisorPendingRow, d: "APPROVED" | "REJECTED") => {
+    setActing(row);
+    setDecision(d);
+    setRemarks("");
+    setRemarksError(null);
+  };
+
+  const handleVerifyFee = async (studentId: string, studentName: string) => {
+    setFeeVerifying(studentId);
+    setError(null);
+    try {
+      await approveStudentFeeVerification(studentId);
+      setNotice(`${studentName}'s fee approved successfully.`);
+      setTimeout(() => setNotice(null), 5000);
+      load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to approve fee.");
+    } finally {
+      setFeeVerifying(null);
+    }
+  };
+
+  const handleDecide = async (ev: React.FormEvent) => {
+    ev.preventDefault();
+    if (!acting) return;
+    if (decision === "REJECTED" && remarks.trim().length === 0) {
+      setRemarksError("Please provide a reason for rejection.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await decideAdvisorApproval({
+        studentId: acting.student.id,
+        decision,
+        remarks: remarks.trim() || null,
+      });
+      setActing(null);
+      setNotice(
+        `${acting.student.user.firstName} ${acting.student.user.lastName} ${decision === "APPROVED" ? "approved" : "rejected"}.`
+      );
+      setTimeout(() => setNotice(null), 5000);
+      load();
+    } catch (err) {
+      setRemarksError(err instanceof ApiError ? err.message : "Failed to record decision.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div>
+      <PageHeader
+        breadcrumb="Advisor / Approvals"
+        title="Student Approvals"
+        description="Students with all subjects staff-approved become available for your review."
+        actions={
+          <Button variant="secondary" onClick={load}>
+            <RefreshCw style={{ width: 14, height: 14 }} />
+            Refresh
+          </Button>
+        }
+      />
+
+      {notice && (
+        <div className="nd-alert nd-alert-success" role="status">
+          <Check style={{ width: 16, height: 16, flexShrink: 0 }} />
+          <span>{notice}</span>
+        </div>
+      )}
+
+      <ApprovalFilterBar
+        search={search}
+        onSearchChange={(val) => {
+          setSearch(val);
+          setCurrentPage(1);
+        }}
+        statusFilter={statusFilter}
+        onStatusChange={(val) => {
+          setStatusFilter(val as AdvisorQueueStatus);
+          setCurrentPage(1);
+        }}
+        counts={counts}
+      />
+
+      {error && !loading && (
+        <div className="nd-card" style={{ marginBottom: 16 }}>
+          <ErrorState message={error} onRetry={load} />
+        </div>
+      )}
+
+      {loading ? (
+        <TableSkeleton rows={8} cols={4} />
+      ) : rows.length === 0 ? (
+        <div className="nd-table-card">
+          <EmptyState
+            title={statusFilter === "pending" ? "No students awaiting review" : "No records found"}
+            description={
+              statusFilter === "pending"
+                ? "Students appear here once all of their subjects are staff-approved."
+                : "No approval records match the current filters."
+            }
+          />
+        </div>
+      ) : (
+        <div className="nd-table-card">
+          <div className="nd-table-scroll">
+            <table className="nd-table" data-testid="advisor-approvals-table">
+              <thead>
+                <tr>
+                  <th>Student</th>
+                  <th>Subjects</th>
+                  <th>Fee Status</th>
+                  <th>Advisor Status</th>
+                  <th style={{ textAlign: "right" }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => {
+                  const key = isDecided(row) ? row.id : row.student.id;
+                  const feeVerified = Boolean(
+                    row.student.feeVerification?.verified ||
+                    row.student.feeVerification?.advisorApproved ||
+                    row.student.feeVerification?.hodApproved
+                  );
+                  return (
+                    <tr key={key}>
+                      <td>
+                        <div className="nd-user-cell">
+                          <div className="nd-avatar" aria-hidden="true">
+                            {row.student.user.firstName[0]}{row.student.user.lastName[0]}
+                          </div>
+                          <div>
+                            <div className="nd-cell-primary">
+                              {row.student.user.firstName} {row.student.user.lastName}
+                            </div>
+                            <div className="nd-cell-secondary" style={{ fontFamily: "monospace", fontSize: 11.5 }}>
+                              {row.student.registerNumber}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="nd-cell-secondary">
+                        {!isDecided(row)
+                          ? row.subjects.map((s) => s.code).join(", ")
+                          : "—"}
+                      </td>
+                      <td>
+                        <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                          {feeVerified ? (
+                            <Badge tone="success">
+                              <Check style={{ width: 11, height: 11, marginRight: 3, display: "inline" }} />
+                              Fee Paid
+                            </Badge>
+                          ) : (
+                            <Badge tone="warning">Pending</Badge>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        <StatusBadge status={row.status} />
+                      </td>
+                      <td style={{ textAlign: "right" }}>
+                        <div style={{ display: "inline-flex", gap: 6, alignItems: "center", justifyContent: "flex-end" }}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              setViewingStatusStudent({
+                                id: row.student.id,
+                                name: `${row.student.user.firstName} ${row.student.user.lastName}`,
+                                registerNumber: row.student.registerNumber,
+                              })
+                            }
+                            aria-label={`View clearance progress for ${row.student.user.firstName}`}
+                            title="View clearance progress"
+                          >
+                            <Activity style={{ width: 14, height: 14 }} />
+                          </Button>
+
+                          {!feeVerified && (
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              onClick={() => handleVerifyFee(row.student.id, `${row.student.user.firstName} ${row.student.user.lastName}`)}
+                              disabled={feeVerifying === row.student.id}
+                              aria-label={`Approve fee for ${row.student.user.firstName}`}
+                              title="Approve student fee"
+                            >
+                              {feeVerifying === row.student.id ? (
+                                <ButtonSpinner />
+                              ) : (
+                                <CreditCard style={{ width: 13, height: 13 }} />
+                              )}
+                              Approve Fee
+                            </Button>
+                          )}
+
+                          {isDecided(row) ? (
+                            <span className="nd-cell-secondary" style={{ fontSize: 12.5 }}>
+                              {new Date(row.updatedAt).toLocaleDateString("en-IN")}
+                            </span>
+                          ) : (
+                            <>
+                              <Button
+                                variant="primary"
+                                size="sm"
+                                onClick={() => openDecision(row, "APPROVED")}
+                                aria-label={`Approve ${row.student.user.firstName}`}
+                                data-testid="advisor-approval-action"
+                              >
+                                <Check style={{ width: 13, height: 13 }} />
+                                Approve
+                              </Button>
+                              <Button
+                                variant="danger"
+                                size="sm"
+                                onClick={() => openDecision(row, "REJECTED")}
+                                aria-label={`Reject ${row.student.user.firstName}`}
+                              >
+                                <X style={{ width: 13, height: 13 }} />
+                                Reject
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <Pagination page={meta.page} totalPages={meta.totalPages} total={meta.total} unit="records" onChange={setCurrentPage} />
+        </div>
+      )}
+
+      {acting && (
+        <Modal
+          title={`Confirm ${decision === "APPROVED" ? "approval" : "rejection"}`}
+          description={`${acting.student.user.firstName} ${acting.student.user.lastName} (${acting.student.registerNumber}) · ${acting.subjects.length} subject${acting.subjects.length !== 1 ? "s" : ""} staff-approved`}
+          onClose={() => setActing(null)}
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setActing(null)}>Cancel</Button>
+              <Button
+                type="submit"
+                form="advisor-decision-form"
+                variant={decision === "APPROVED" ? "primary" : "danger"}
+                disabled={submitting}
+              >
+                {submitting && <ButtonSpinner />}
+                {submitting ? "Saving..." : decision === "APPROVED" ? "Confirm Approval" : "Confirm Rejection"}
+              </Button>
+            </>
+          }
+        >
+          <form id="advisor-decision-form" onSubmit={handleDecide} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ display: "flex", gap: 8 }} role="group" aria-label="Decision">
+              <Button
+                type="button"
+                variant={decision === "APPROVED" ? "primary" : "secondary"}
+                onClick={() => { setDecision("APPROVED"); setRemarksError(null); }}
+              >
+                <Check style={{ width: 14, height: 14 }} /> Approve
+              </Button>
+              <Button
+                type="button"
+                variant={decision === "REJECTED" ? "danger" : "secondary"}
+                onClick={() => { setDecision("REJECTED"); setRemarksError(null); }}
+              >
+                <X style={{ width: 14, height: 14 }} /> Reject
+              </Button>
+            </div>
+            <Input
+              label={decision === "REJECTED" ? "Rejection reason (required)" : "Remarks (optional)"}
+              placeholder={decision === "REJECTED" ? "e.g. Attendance below requirement" : "Optional note"}
+              value={remarks}
+              maxLength={500}
+              onChange={(e) => { setRemarks(e.target.value); setRemarksError(null); }}
+              error={remarksError ?? undefined}
+              autoComplete="off"
+            />
+          </form>
+        </Modal>
+      )}
+
+      {viewingStatusStudent && (
+        <ClearanceModal
+          isOpen={Boolean(viewingStatusStudent)}
+          onClose={() => setViewingStatusStudent(null)}
+          studentId={viewingStatusStudent.id}
+          studentName={viewingStatusStudent.name}
+          registerNumber={viewingStatusStudent.registerNumber}
+          loadStatus={getAdvisorStudentStatus}
+          fullPageUrl={`/advisor/students/${viewingStatusStudent.id}/status`}
+        />
+      )}
+    </div>
+  );
+}

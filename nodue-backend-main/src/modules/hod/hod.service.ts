@@ -1,0 +1,820 @@
+import { hodRepository } from "./hod.repository";
+import { prisma } from "../../plugins/database";
+import { cacheService } from "../../plugins/redis";
+import { hashPassword } from "../../utils/password";
+import { auditService } from "../../utils/auditService";
+import { ConflictError, ForbiddenError, NotFoundError } from "../../utils/errors";
+import {
+  CreateClassroomInput,
+  UpdateClassroomInput,
+  GetClassroomsQuery,
+  CreateAdvisorInput,
+  UpdateAdvisorInput,
+  GetAdvisorsQuery,
+  UpdateDepartmentInput,
+  GetHodAuditLogsQuery,
+  GetHodApprovalsQuery,
+  DecideHodApprovalInput,
+  GetHodFeesQuery,
+  ApproveFeeVerificationInput,
+  GetHodStudentsQuery,
+  UpdateHodStudentInput,
+} from "./hod.schema";
+import { approvalEngine, deriveFinalVerification, StageDecision } from "../approval-engine/approval-engine.service";
+import { Role } from "@prisma/client";
+import { toCsvString } from "../../utils/csvParser";
+import { studentRepository } from "../student/student.repository";
+
+export const hodService = {
+  // ─── Dashboard & Department ─────────────────────────────────────────────────
+
+  async getDashboard(departmentId: string) {
+    const cacheKey = `hod:dashboard:${departmentId}`;
+    const cached = await cacheService.get<Record<string, unknown>>(cacheKey);
+    if (cached) return cached;
+
+    const department = await hodRepository.getDepartmentDetails(departmentId);
+    if (!department) {
+      throw new NotFoundError("Department not found");
+    }
+
+    const recentLogs = await hodRepository.getPaginatedAuditLogs(departmentId, {
+      page: 1,
+      limit: 10,
+    });
+
+    const result = {
+      department,
+      recentActivity: recentLogs.data,
+    };
+
+    // Cache for 60 seconds
+    await cacheService.set(cacheKey, result, 60);
+    return result;
+  },
+
+  async getDepartment(departmentId: string) {
+    const department = await hodRepository.getDepartmentDetails(departmentId);
+    if (!department) {
+      throw new NotFoundError("Department not found");
+    }
+    return department;
+  },
+
+  async updateDepartment(
+    departmentId: string,
+    input: UpdateDepartmentInput,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    const updated = await hodRepository.updateDepartment(departmentId, input.name);
+
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+    await cacheService.del("departments:list");
+
+    await auditService.log({
+      actorUserId,
+      departmentId,
+      action: "DEPARTMENT_UPDATED",
+      entityType: "Department",
+      entityId: departmentId,
+      metadata: { name: input.name },
+      ipAddress,
+    });
+
+    return updated;
+  },
+
+  // ─── Classroom Service Methods ──────────────────────────────────────────────
+
+  async getClassrooms(departmentId: string, query: GetClassroomsQuery) {
+    return hodRepository.getPaginatedClassrooms(departmentId, query);
+  },
+
+  async getClassroomById(id: string, departmentId: string) {
+    // 1. Check if classroom exists in the database
+    const classroomAny = await prisma.classroom.findUnique({
+      where: { id },
+      select: { id: true, departmentId: true },
+    });
+
+    if (!classroomAny) {
+      throw new NotFoundError("Classroom not found");
+    }
+
+    // 2. Strict department isolation: if belongs to another department, reject with 403 Forbidden
+    if (classroomAny.departmentId !== departmentId) {
+      throw new ForbiddenError("Access denied. Classroom does not belong to your department.");
+    }
+
+    return hodRepository.getClassroomById(id, departmentId);
+  },
+
+  async createClassroom(
+    departmentId: string,
+    data: CreateClassroomInput,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    // Prevent duplicate classroom identity in same department
+    const existing = await hodRepository.findClassroomByUniqueIdentity(
+      departmentId,
+      data.name,
+      data.batch,
+      data.semester,
+      data.section
+    );
+
+    if (existing) {
+      throw new ConflictError(
+        "A classroom with this name or batch/semester/section already exists in your department."
+      );
+    }
+
+    const classroom = await hodRepository.createClassroom(departmentId, data);
+
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+
+    await auditService.log({
+      actorUserId,
+      departmentId,
+      action: "CLASSROOM_CREATED",
+      entityType: "Classroom",
+      entityId: classroom.id,
+      metadata: {
+        name: classroom.name,
+        batch: classroom.batch,
+        semester: classroom.semester,
+        section: classroom.section,
+      },
+      ipAddress,
+    });
+
+    return classroom;
+  },
+
+  async updateClassroom(
+    id: string,
+    departmentId: string,
+    data: UpdateClassroomInput,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    // 1. Verify existence and department scope
+    const existing = await prisma.classroom.findUnique({
+      where: { id },
+      select: { id: true, departmentId: true, name: true, batch: true, semester: true, section: true },
+    });
+
+    if (!existing) {
+      throw new NotFoundError("Classroom not found");
+    }
+
+    if (existing.departmentId !== departmentId) {
+      throw new ForbiddenError("Access denied. Classroom does not belong to your department.");
+    }
+
+    // 2. If identity changed, ensure no collision with another classroom
+    const targetName = data.name ?? existing.name;
+    const targetBatch = data.batch ?? existing.batch;
+    const targetSemester = data.semester ?? existing.semester;
+    const targetSection = data.section ?? existing.section;
+
+    const duplicate = await prisma.classroom.findFirst({
+      where: {
+        departmentId,
+        id: { not: id },
+        OR: [
+          { name: targetName },
+          { batch: targetBatch, semester: targetSemester, section: targetSection },
+        ],
+      },
+    });
+
+    if (duplicate) {
+      throw new ConflictError(
+        "Another classroom with this name or batch/semester/section already exists in your department."
+      );
+    }
+
+    const updated = await hodRepository.updateClassroom(id, departmentId, data);
+
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+
+    await auditService.log({
+      actorUserId,
+      departmentId,
+      action: "CLASSROOM_UPDATED",
+      entityType: "Classroom",
+      entityId: updated.id,
+      metadata: { changes: data },
+      ipAddress,
+    });
+
+    return updated;
+  },
+
+  // ─── Advisor Service Methods ────────────────────────────────────────────────
+
+  async getAdvisors(departmentId: string, query: GetAdvisorsQuery) {
+    return hodRepository.getPaginatedAdvisors(departmentId, query);
+  },
+
+  async getAdvisorById(id: string, departmentId: string) {
+    // 1. Check if user or advisor exists anywhere
+    const userAny = await prisma.user.findFirst({
+      where: {
+        OR: [{ id }, { advisorProfile: { id } }],
+      },
+      select: { id: true, departmentId: true, role: true },
+    });
+
+    if (!userAny) {
+      throw new NotFoundError("Advisor not found");
+    }
+
+    // 2. Strict department isolation
+    if (userAny.departmentId !== departmentId || userAny.role !== "ADVISOR") {
+      throw new ForbiddenError("Access denied. Advisor does not belong to your department.");
+    }
+
+    return hodRepository.getAdvisorById(id, departmentId);
+  },
+
+  async createAdvisor(
+    departmentId: string,
+    data: CreateAdvisorInput,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    // 1. Check if email already taken
+    const existingUser = await prisma.user.findUnique({
+      where: { email: data.email },
+    });
+
+    if (existingUser) {
+      throw new ConflictError("An account with this email address already exists.");
+    }
+
+    // 2. If classroomId provided, verify it belongs to this department
+    if (data.classroomId) {
+      const classroom = await prisma.classroom.findFirst({
+        where: { id: data.classroomId },
+        select: { id: true, departmentId: true },
+      });
+
+      if (!classroom) {
+        throw new NotFoundError("Assigned classroom not found");
+      }
+
+      if (classroom.departmentId !== departmentId) {
+        throw new ForbiddenError(
+          "Access denied. Cannot assign advisor to a classroom from another department."
+        );
+      }
+    }
+
+    // 3. Hash password using Argon2id
+    const passwordHash = await hashPassword(data.password);
+
+    // 4. Create in atomic transaction
+    const advisor = await hodRepository.createAdvisor(
+      departmentId,
+      {
+        firstName: data.firstName,
+        lastName: data.lastName,
+        email: data.email,
+        passwordHash,
+      },
+      data.classroomId
+    );
+
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+
+    await auditService.log({
+      actorUserId,
+      departmentId,
+      action: "ADVISOR_CREATED",
+      entityType: "User",
+      entityId: advisor.userId,
+      metadata: {
+        email: advisor.email,
+        firstName: advisor.firstName,
+        lastName: advisor.lastName,
+        classroomId: advisor.classroomId,
+      },
+      ipAddress,
+    });
+
+    return advisor;
+  },
+
+  async updateAdvisor(
+    id: string,
+    departmentId: string,
+    data: UpdateAdvisorInput,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    // 1. Verify existence & department scope
+    const advisor = await hodRepository.getAdvisorById(id, departmentId);
+
+    if (!advisor) {
+      // Check if exists in another department
+      const otherUser = await prisma.user.findFirst({
+        where: { OR: [{ id }, { advisorProfile: { id } }] },
+      });
+      if (otherUser) {
+        throw new ForbiddenError("Access denied. Advisor does not belong to your department.");
+      }
+      throw new NotFoundError("Advisor not found");
+    }
+
+    if (data.email && data.email !== advisor.user.email) {
+      const existing = await prisma.user.findUnique({ where: { email: data.email } });
+      if (existing) {
+        throw new ConflictError(`A user with email '${data.email}' already exists.`);
+      }
+    }
+
+    const updated = await hodRepository.updateAdvisorUser(advisor.userId, data);
+
+    // If account was deactivated, invalidate session token and Redis cache
+    if (data.isActive === false) {
+      await cacheService.del(`user:active:${advisor.userId}`);
+      await prisma.refreshToken.updateMany({
+        where: { userId: advisor.userId },
+        data: { revoked: true },
+      });
+    }
+
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+
+    await auditService.log({
+      actorUserId,
+      departmentId,
+      action: data.isActive !== undefined ? "USER_STATUS_UPDATED" : "ADVISOR_UPDATED",
+      entityType: "User",
+      entityId: advisor.userId,
+      metadata: { changes: data },
+      ipAddress,
+    });
+
+    return updated;
+  },
+
+  async assignAdvisorClassroom(
+    advisorId: string,
+    classroomId: string | null,
+    departmentId: string,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    // 1. Verify advisor exists and belongs to department
+    const advisor = await prisma.advisor.findFirst({
+      where: {
+        OR: [{ id: advisorId }, { userId: advisorId }],
+      },
+      include: { user: { select: { id: true, departmentId: true, firstName: true, lastName: true } } },
+    });
+
+    if (!advisor) {
+      throw new NotFoundError("Advisor not found");
+    }
+
+    if (advisor.user.departmentId !== departmentId) {
+      throw new ForbiddenError("Access denied. Advisor does not belong to your department.");
+    }
+
+    // 2. If classroomId provided, verify it exists and belongs to department
+    if (classroomId !== null) {
+      const classroom = await prisma.classroom.findUnique({
+        where: { id: classroomId },
+        select: { id: true, departmentId: true, name: true },
+      });
+
+      if (!classroom) {
+        throw new NotFoundError("Classroom not found");
+      }
+
+      if (classroom.departmentId !== departmentId) {
+        throw new ForbiddenError("Access denied. Classroom belongs to another department.");
+      }
+    }
+
+    // 3. Atomically assign in repository
+    const result = await hodRepository.assignAdvisorToClassroom(advisor.id, classroomId, departmentId);
+
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+
+    await auditService.log({
+      actorUserId,
+      departmentId,
+      action: classroomId ? "ADVISOR_ASSIGNED" : "ADVISOR_UNASSIGNED",
+      entityType: "Advisor",
+      entityId: advisor.id,
+      metadata: {
+        advisorUserId: advisor.userId,
+        classroomId,
+      },
+      ipAddress,
+    });
+
+    return result;
+  },
+
+  // ─── Audit Logs ─────────────────────────────────────────────────────────────
+
+  async getAuditLogs(departmentId: string, query: GetHodAuditLogsQuery) {
+    return hodRepository.getPaginatedAuditLogs(departmentId, query);
+  },
+
+  // ─── Approvals & Fees Foundations (Phase 7) ─────────────────────────────────
+
+  async getApprovalsSummary(departmentId: string) {
+    const candidates = await hodRepository.getApprovalQueueCandidates(departmentId);
+    const pendingCount = candidates.filter((s) => {
+      const subjects = s.classroom.subjects;
+      if (subjects.length === 0) return false;
+      const allApproved = subjects.every((sub) =>
+        sub.approvals.some((a) => a.studentId === s.id && a.status === "APPROVED")
+      );
+      if (!allApproved) return false;
+      const advisor = s.approvals.find((a) => a.approverRole === Role.ADVISOR);
+      if (!advisor || advisor.status !== "APPROVED") return false;
+      return !s.approvals.some((a) => a.approverRole === Role.HOD);
+    }).length;
+
+    return {
+      pendingApprovals: pendingCount,
+      departmentId,
+    };
+  },
+
+  async getFeesSummary(departmentId: string) {
+    return hodRepository.getFeeSummary(departmentId);
+  },
+
+  // ─── Approvals (Phase 7: HOD stage) ───────────────────────────────────────
+
+  async getApprovals(departmentId: string, query: GetHodApprovalsQuery) {
+    if (query.status !== "pending") {
+      return hodRepository.getDecidedApprovals(departmentId, {
+        page: query.page,
+        limit: query.limit,
+        search: query.search,
+        status: query.status === "decided" ? undefined : query.status.toUpperCase() as "APPROVED" | "REJECTED",
+      });
+    }
+
+    const candidates = await hodRepository.getApprovalQueueCandidates(departmentId, query.search);
+    const pending = candidates.filter((s) => {
+      const subjects = s.classroom.subjects;
+      if (subjects.length === 0) return false;
+      const allApproved = subjects.every((sub) =>
+        sub.approvals.some((a) => a.studentId === s.id && a.status === "APPROVED")
+      );
+      if (!allApproved) return false;
+      const advisor = s.approvals.find((a) => a.approverRole === Role.ADVISOR);
+      if (!advisor || advisor.status !== "APPROVED") return false;
+      return !s.approvals.some((a) => a.approverRole === Role.HOD);
+    });
+
+    const start = (query.page - 1) * query.limit;
+    return {
+      data: pending.slice(start, start + query.limit).map((s) => ({
+        student: {
+          id: s.id,
+          registerNumber: s.registerNumber,
+          classroom: { id: s.classroom.id, name: s.classroom.name },
+          user: s.user,
+          feeVerification: {
+            verified: Boolean(s.feeVerification?.advisorApproved || s.feeVerification?.hodApproved),
+            advisorApproved: s.feeVerification?.advisorApproved ?? false,
+            hodApproved: s.feeVerification?.hodApproved ?? false,
+          },
+        },
+        subjects: s.classroom.subjects.map((sub) => ({ id: sub.id, code: sub.code, name: sub.name })),
+        advisorDecision: (s.approvals.find((a) => a.approverRole === Role.ADVISOR)?.status ?? "PENDING") as "APPROVED" | "PENDING" | "REJECTED",
+        status: "PENDING" as const,
+      })),
+      meta: {
+        total: pending.length,
+        page: query.page,
+        limit: query.limit,
+        totalPages: Math.ceil(pending.length / query.limit),
+      },
+    };
+  },
+
+  async decideApproval(
+    departmentId: string,
+    userId: string,
+    input: DecideHodApprovalInput,
+    ipAddress?: string,
+    userAgent?: string
+  ) {
+    // Engine re-validates scope + state transactionally; the pre-check below
+    // produces precise 403/404/409 reasons before attempting the write.
+    await approvalEngine.assertHodApprovable(input.studentId, departmentId);
+    const result = await approvalEngine.decideStudentApproval({
+      studentId: input.studentId,
+      role: Role.HOD,
+      approverUserId: userId,
+      departmentId,
+      decision: input.decision,
+      remarks: input.remarks || null,
+      ipAddress,
+      userAgent,
+    });
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+    return result;
+  },
+
+  // ─── Fee Verifications (department/classroom scope, OR rule) ────────────
+
+  async getFeeVerifications(departmentId: string, query: GetHodFeesQuery) {
+    if (query.classroomId) {
+      const room = await prisma.classroom.findFirst({
+        where: { id: query.classroomId, departmentId },
+        select: { id: true },
+      });
+      if (!room) {
+        const exists = await prisma.classroom.findUnique({
+          where: { id: query.classroomId },
+          select: { id: true },
+        });
+        if (exists) {
+          throw new ForbiddenError("This classroom belongs to another department.");
+        }
+        throw new NotFoundError("Classroom not found.");
+      }
+    }
+    return hodRepository.getFeeVerifications(departmentId, query);
+  },
+
+  async approveFeeVerification(
+    departmentId: string,
+    userId: string,
+    input: ApproveFeeVerificationInput,
+    ipAddress?: string,
+    userAgent?: string
+  ) {
+    const result = await approvalEngine.approveFeeVerification({
+      studentId: input.studentId,
+      role: Role.HOD,
+      approverUserId: userId,
+      departmentId,
+      ipAddress,
+      userAgent,
+    });
+    await cacheService.del(`hod:dashboard:${departmentId}`);
+    return result;
+  },
+
+  // ─── Export Reports ───────────────────────────────────────────────────────
+
+  async exportDefaultersCsv(departmentId: string): Promise<string> {
+    const students = await hodRepository.getDepartmentStudentsForReport(departmentId);
+
+    const headers = [
+      "Register Number",
+      "Student Name",
+      "Email",
+      "Classroom",
+      "Fee Verified",
+      "Staff Approvals (Approved/Total)",
+      "Advisor Approval",
+      "HOD Approval",
+      "Defaulter Reasons",
+    ];
+
+    const rows: (string | number)[][] = [];
+
+    for (const s of students) {
+      const totalSubjects = s.classroom.subjects.length;
+      const staffApprovedCount = s.approvals.filter((a) => a.approverRole === Role.STAFF && a.status === "APPROVED").length;
+      const staffRejectedCount = s.approvals.filter((a) => a.approverRole === Role.STAFF && a.status === "REJECTED").length;
+
+      const advisorAppr = s.approvals.find((a) => a.approverRole === Role.ADVISOR && !a.subjectId);
+      const hodAppr = s.approvals.find((a) => a.approverRole === Role.HOD && !a.subjectId);
+
+      const feeVerified = Boolean(
+        s.feeVerification?.advisorApproved ||
+        s.feeVerification?.hodApproved ||
+        s.feeVerification?.cashierApproved
+      );
+      const advisorDecision = (advisorAppr?.status as StageDecision) ?? "PENDING";
+      const hodDecision = (hodAppr?.status as StageDecision) ?? "PENDING";
+
+      const fv = deriveFinalVerification({
+        subjectsTotal: totalSubjects,
+        subjectsApproved: staffApprovedCount,
+        subjectsRejected: staffRejectedCount,
+        advisorDecision,
+        hodDecision,
+        feeByAdvisor: s.feeVerification?.advisorApproved ?? false,
+        feeByHod: s.feeVerification?.hodApproved ?? false,
+        feeByCashier: s.feeVerification?.cashierApproved ?? false,
+        isVerified: true,
+      });
+
+      if (!fv.eligible) {
+        const reasons: string[] = [];
+        if (!feeVerified) reasons.push("Pending Fee Verification");
+        if (staffRejectedCount > 0) reasons.push(`${staffRejectedCount} subject(s) rejected by staff`);
+        if (staffApprovedCount < totalSubjects) reasons.push(`Staff pending (${staffApprovedCount}/${totalSubjects} approved)`);
+        if (advisorDecision !== "APPROVED") reasons.push(`Advisor ${advisorDecision.toLowerCase()}`);
+        if (hodDecision !== "APPROVED") reasons.push(`HOD ${hodDecision.toLowerCase()}`);
+
+        rows.push([
+          s.registerNumber,
+          `${s.user.firstName} ${s.user.lastName}`,
+          s.user.email,
+          s.classroom.name,
+          feeVerified ? "YES" : "NO",
+          `${staffApprovedCount}/${totalSubjects}`,
+          advisorDecision,
+          hodDecision,
+          reasons.join("; "),
+        ]);
+      }
+    }
+
+    return toCsvString(headers, rows);
+  },
+
+  async exportClearanceSummaryCsv(departmentId: string): Promise<string> {
+    const students = await hodRepository.getDepartmentStudentsForReport(departmentId);
+
+    const headers = [
+      "Register Number",
+      "Student Name",
+      "Email",
+      "Classroom",
+      "Fee Verified",
+      "Staff Approvals",
+      "Advisor Status",
+      "HOD Status",
+      "Overall Clearance",
+    ];
+
+    const rows: (string | number)[][] = [];
+
+    for (const s of students) {
+      const totalSubjects = s.classroom.subjects.length;
+      const staffApprovedCount = s.approvals.filter((a) => a.approverRole === Role.STAFF && a.status === "APPROVED").length;
+      const staffRejectedCount = s.approvals.filter((a) => a.approverRole === Role.STAFF && a.status === "REJECTED").length;
+
+      const advisorAppr = s.approvals.find((a) => a.approverRole === Role.ADVISOR && !a.subjectId);
+      const hodAppr = s.approvals.find((a) => a.approverRole === Role.HOD && !a.subjectId);
+
+      const feeVerified = Boolean(
+        s.feeVerification?.advisorApproved ||
+        s.feeVerification?.hodApproved ||
+        s.feeVerification?.cashierApproved
+      );
+      const advisorDecision = (advisorAppr?.status as StageDecision) ?? "PENDING";
+      const hodDecision = (hodAppr?.status as StageDecision) ?? "PENDING";
+
+      const fv = deriveFinalVerification({
+        subjectsTotal: totalSubjects,
+        subjectsApproved: staffApprovedCount,
+        subjectsRejected: staffRejectedCount,
+        advisorDecision,
+        hodDecision,
+        feeByAdvisor: s.feeVerification?.advisorApproved ?? false,
+        feeByHod: s.feeVerification?.hodApproved ?? false,
+        feeByCashier: s.feeVerification?.cashierApproved ?? false,
+        isVerified: true,
+      });
+
+      rows.push([
+        s.registerNumber,
+        `${s.user.firstName} ${s.user.lastName}`,
+        s.user.email,
+        s.classroom.name,
+        feeVerified ? "YES" : "NO",
+        `${staffApprovedCount}/${totalSubjects}`,
+        advisorDecision,
+        hodDecision,
+        fv.eligible ? "CLEARED" : "INCOMPLETE",
+      ]);
+    }
+
+    return toCsvString(headers, rows);
+  },
+
+  // ─── Students (department clearance view) ────────────────────────────────
+
+  async getStudents(departmentId: string, query: GetHodStudentsQuery) {
+    return hodRepository.getStudents(departmentId, query);
+  },
+
+  async getStudentStatus(departmentId: string, studentId: string) {
+    const student = await hodRepository.findStudentInDepartment(studentId, departmentId);
+    if (!student) {
+      throw new NotFoundError("Student not found in this department.");
+    }
+    // Reuse the student repository's snapshot logic.
+    return studentRepository.getStatusSnapshot({
+      studentId,
+      userId: student.user.id,
+      classroomId: student.classroomId,
+      departmentId: student.departmentId,
+    });
+  },
+
+  async updateStudent(departmentId: string, studentId: string, input: UpdateHodStudentInput) {
+    const updated = await hodRepository.updateStudentInDepartment(studentId, departmentId, input);
+    if (!updated) {
+      throw new NotFoundError("Student not found in this department.");
+    }
+    return updated;
+  },
+
+  async resetAllApprovalsForNextSem(
+    departmentId: string,
+    hodUserId: string,
+    ipAddress?: string,
+    userAgent?: string
+  ) {
+    return prisma.$transaction(async (tx) => {
+      // Find all students in this department
+      const students = await tx.student.findMany({
+        where: { departmentId },
+        select: { id: true },
+      });
+      const studentIds = students.map((s) => s.id);
+
+      let resetApprovalsCount = 0;
+      let resetFeesCount = 0;
+      let resetStudentsCount = 0;
+
+      if (studentIds.length > 0) {
+        // 1. Reset all staff/advisor/hod approvals for these department students
+        const appRes = await tx.approval.updateMany({
+          where: { studentId: { in: studentIds } },
+          data: {
+            status: "PENDING",
+            approverUserId: null,
+            remarks: null,
+          },
+        });
+        resetApprovalsCount = appRes.count;
+
+        // 2. Reset fee verifications for these students
+        const feeRes = await tx.feeVerification.updateMany({
+          where: { studentId: { in: studentIds } },
+          data: {
+            advisorApproved: false,
+            advisorById: null,
+            hodApproved: false,
+            hodById: null,
+            cashierApproved: false,
+            cashierById: null,
+          },
+        });
+        resetFeesCount = feeRes.count;
+
+        // 3. Reset final student verification flag
+        const stRes = await tx.student.updateMany({
+          where: { id: { in: studentIds }, isVerified: true },
+          data: {
+            isVerified: false,
+            verifiedAt: null,
+          },
+        });
+        resetStudentsCount = stRes.count;
+      }
+
+      // Invalidate HOD and department caches
+      await cacheService.del(`hod:dashboard:${departmentId}`);
+
+      // Log the reset event
+      await auditService.log({
+        actorUserId: hodUserId,
+        departmentId,
+        action: "NEXT_SEMESTER_APPROVALS_RESET",
+        entityType: "Department",
+        entityId: departmentId,
+        metadata: {
+          resetApprovalsCount,
+          resetFeesCount,
+          resetStudentsCount,
+          totalDepartmentStudents: studentIds.length,
+        },
+        ipAddress,
+        userAgent,
+      });
+
+      return {
+        departmentId,
+        resetApprovalsCount,
+        resetFeesCount,
+        resetStudentsCount,
+        totalStudents: studentIds.length,
+      };
+    });
+  },
+};
