@@ -121,14 +121,18 @@ jobs:
 
       - name: Verify Frontend
         run: |
-          echo "🔍 Testing frontend..."
-          if curl -sf http://localhost:3000/login > /dev/null; then
-            echo "✅ Frontend is responding!"
-          else
-            echo "❌ Frontend is not responding"
-            docker compose logs frontend
-            exit 1
-          fi
+          echo "⏳ Waiting for frontend to become ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/login > /dev/null; then
+              echo "✅ Frontend is responding!"
+              exit 0
+            fi
+            echo "  Attempt $i/30 - retrying in 5s..."
+            sleep 5
+          done
+          echo "❌ Frontend failed to respond"
+          docker compose logs frontend
+          exit 1
 
       - name: Cleanup Old Docker Resources
         run: docker system prune -f --volumes --filter "until=168h" || true
